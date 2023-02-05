@@ -1,0 +1,203 @@
+'''
+    file:   merge_pkl_demo.py
+
+    date:   2018_05_03
+    author: zhangxiong(1025679612@qq.com)
+    mark:   the algorithm is cited from original SMPL
+'''
+import torch
+from merge_config import args
+import json
+import sys
+import numpy as np
+from merge_util import batch_global_rigid_transformation, batch_rodrigues, batch_lrotmin, reflect_pose
+import torch.nn as nn
+
+
+class SMPL(nn.Module):
+    def __init__(self, model_path, joint_type='cocoplus', obj_saveable=False):
+        super(SMPL, self).__init__()
+
+        if joint_type not in ['cocoplus', 'lsp']:
+            msg = 'unknow joint type: {}, it must be either "cocoplus" or "lsp"'.format(joint_type)
+            sys.exit(msg)
+
+        self.model_path = model_path
+        self.joint_type = joint_type
+        with open(model_path, 'r') as reader:
+            model = json.load(reader)
+
+        if obj_saveable:
+            self.faces = model['f']
+        else:
+            self.faces = None
+
+        np_v_template = np.array(model['v_template'], dtype=float)
+        self.register_buffer('v_template', torch.from_numpy(np_v_template).float())
+        self.size = [np_v_template.shape[0], 3]
+
+        np_shapedirs = np.array(model['shapedirs'], dtype=float)
+        self.num_betas = np_shapedirs.shape[-1]
+        np_shapedirs = np.reshape(np_shapedirs, [-1, self.num_betas]).T
+        self.register_buffer('shapedirs', torch.from_numpy(np_shapedirs).float())
+
+        np_J_regressor = np.array(model['J_regressor'], dtype=float)
+        self.register_buffer('J_regressor', torch.from_numpy(np_J_regressor).float())
+
+        np_posedirs = np.array(model['posedirs'], dtype=float)
+        num_pose_basis = np_posedirs.shape[-1]
+        np_posedirs = np.reshape(np_posedirs, [-1, num_pose_basis]).T
+        self.register_buffer('posedirs', torch.from_numpy(np_posedirs).float())
+
+        self.parents = np.array(model['kintree_table'])[0].astype(np.int32)
+
+        np_joint_regressor = np.array(model['cocoplus_regressor'], dtype=float)
+        if joint_type == 'lsp':
+            self.register_buffer('joint_regressor', torch.from_numpy(np_joint_regressor[:, :14]).float())
+        else:
+            self.register_buffer('joint_regressor', torch.from_numpy(np_joint_regressor).float())
+
+        np_weights = np.array(model['weights'], dtype=float)
+
+        vertex_count = np_weights.shape[0]
+        vertex_component = np_weights.shape[1]
+
+        batch_size = max(args.batch_size + args.batch_3d_size, args.eval_batch_size)
+        np_weights = np.tile(np_weights, (batch_size, 1))
+        self.register_buffer('weight', torch.from_numpy(np_weights).float().reshape(-1, vertex_count, vertex_component))
+
+        self.register_buffer('e3', torch.eye(3).float())
+
+        self.cur_device = None
+
+    def save_obj(self, verts, obj_mesh_name):
+        if not self.faces:
+            msg = 'obj not saveable!'
+            sys.exit(msg)
+
+        with open(obj_mesh_name, 'w') as fp:
+            for v in verts:
+                fp.write('v %f %f %f\n' % (v[0], v[1], v[2]))
+
+            for f in self.faces:  # Faces are 1-based, not 0-based in obj files
+                fp.write('f %d %d %d\n' % (f[0] + 1, f[1] + 1, f[2] + 1))
+
+    def forward(self, beta, theta, get_skin=False):
+        if not self.cur_device:
+            device = beta.device
+            self.cur_device = torch.device(device.type, device.index)
+
+        num_batch = beta.shape[0]
+
+        v_shaped = torch.matmul(beta, self.shapedirs).view(-1, self.size[0], self.size[1]) + self.v_template
+        Jx = torch.matmul(v_shaped[:, :, 0], self.J_regressor)
+        Jy = torch.matmul(v_shaped[:, :, 1], self.J_regressor)
+        Jz = torch.matmul(v_shaped[:, :, 2], self.J_regressor)
+        J = torch.stack([Jx, Jy, Jz], dim=2)
+
+        Rs = batch_rodrigues(theta.view(-1, 3)).view(-1, 24, 3, 3)
+        pose_feature = (Rs[:, 1:, :, :]).sub(1.0, self.e3).view(-1, 207)
+        v_posed = torch.matmul(pose_feature, self.posedirs).view(-1, self.size[0], self.size[1]) + v_shaped
+        self.J_transformed, A = batch_global_rigid_transformation(Rs, J, self.parents, rotate_base=True)
+
+        weight = self.weight[:num_batch]
+        W = weight.view(num_batch, -1, 24)
+        T = torch.matmul(W, A.view(num_batch, 24, 16)).view(num_batch, -1, 4, 4)
+
+        v_posed_homo = torch.cat([v_posed, torch.ones(num_batch, v_posed.shape[1], 1, device=self.cur_device)], dim=2)
+        v_homo = torch.matmul(T, torch.unsqueeze(v_posed_homo, -1))
+
+        verts = v_homo[:, :, :3, 0]
+
+        joint_x = torch.matmul(verts[:, :, 0], self.joint_regressor)
+        joint_y = torch.matmul(verts[:, :, 1], self.joint_regressor)
+        joint_z = torch.matmul(verts[:, :, 2], self.joint_regressor)
+
+        joints = torch.stack([joint_x, joint_y, joint_z], dim=2)
+
+        if get_skin:
+            return verts, joints, Rs
+        else:
+            return joints
+
+
+if __name__ == '__main__':
+    device = torch.device('cuda', 0)
+    # smpl = SMPL(args.smpl_model, obj_saveable = True).to(device)
+    smpl = SMPL('HMR-data/neutral_smpl_with_cocoplus_reg.txt', obj_saveable=True).to(device)
+    pose = np.array([
+        1.22162998e+00, 1.17162502e+00, 1.16706634e+00,
+        -1.20581151e-03, 8.60930011e-02, 4.45963144e-02,
+        -1.52801601e-02, -1.16911056e-02, -6.02894090e-03,
+        1.62427306e-01, 4.26302850e-02, -1.55304456e-02,
+        2.58729942e-02, -2.15941742e-01, -6.59851432e-02,
+        7.79098943e-02, 1.96353287e-01, 6.44420758e-02,
+        -5.43042570e-02, -3.45508829e-02, 1.13200583e-02,
+        -5.60734887e-04, 3.21716577e-01, -2.18840033e-01,
+        -7.61821344e-02, -3.64610642e-01, 2.97633410e-01,
+        9.65453908e-02, -5.54007106e-03, 2.83410680e-02,
+        -9.57194716e-02, 9.02515948e-02, 3.31488043e-01,
+        -1.18847653e-01, 2.96623230e-01, -4.76809204e-01,
+        -1.53382001e-02, 1.72342166e-01, -1.44332021e-01,
+        -8.10869411e-02, 4.68325168e-02, 1.42248288e-01,
+        -4.60898802e-02, -4.05981280e-02, 5.28727695e-02,
+        3.20133418e-02, -5.23784310e-02, 2.41559884e-03,
+        -3.08033824e-01, 2.31431410e-01, 1.62540793e-01,
+        6.28208935e-01, -1.94355965e-01, 7.23800480e-01,
+        -6.49612308e-01, -4.07179184e-02, -1.46422181e-02,
+        4.51475441e-01, 1.59122205e+00, 2.70355493e-01,
+        2.04248756e-01, -6.33800551e-02, -5.50178960e-02,
+        -1.00920045e+00, 2.39532292e-01, 3.62904727e-01,
+        -3.38783532e-01, 9.40650925e-02, -8.44506770e-02,
+        3.55101633e-03, -2.68924050e-02, 4.93676625e-02], dtype=float)
+    # pose gta
+    pose = np.array([-1.06356069e-01, -6.37851134e-02, 1.28229275e-01, 3.14740166e-02
+                        , 6.96886517e-03, -5.28118573e-03, 1.10189825e-01, 6.98541477e-02
+                        , -2.66963821e-02, 1.32812247e-01, -2.03864664e-01, 2.89163440e-02
+                        , 1.16681933e-01, 2.06119910e-01, -4.80791740e-02, -2.18707517e-01
+                        , -8.01814813e-03, 1.82050299e-02, -1.28349841e-01, 2.22675905e-01
+                        , 3.26793492e-02, -2.06748575e-01, -1.49768770e-01, 7.15743452e-02
+                        , 1.65331662e-01, 1.38076292e-02, -1.42812368e-03, -2.06260402e-02
+                        , -2.21656114e-02, -1.73571818e-02, -3.12202759e-02, 1.78035423e-02
+                        , 1.57488566e-02, 7.14080036e-02, 1.42807439e-02, 1.13723464e-01
+                        , -4.22706939e-02, 9.08964500e-02, -5.61761893e-02, -3.77132706e-02
+                        , -7.63041452e-02, 1.39894500e-01, 5.07261515e-01, -1.79262087e-01
+                        , 8.70353431e-02, 1.48569643e-01, -3.87416214e-01, -9.28629994e-01
+                        , 3.01834077e-01, 3.44428927e-01, 9.85755265e-01, 5.37861466e-01
+                        , -2.59827077e-01, -2.08760008e-01, 5.28815627e-01, 4.55017388e-01
+                        , 2.53529418e-02, -7.59927928e-02, -1.38382733e-01, -9.92430225e-02
+                        , -1.50544690e-02, 3.49707603e-02, 1.02849029e-01, 0.00000000e+00
+                        , 0.00000000e+00, 0.00000000e+00, -1.57515180e+00, 6.07206464e-01
+                        , -2.32540131e+00, -2.63700366e-01, 9.43108380e-01, 1.82193077e+00]
+                    , dtype=float)
+    pose = np.array(
+        [-1.54266307, 0.60376256, -2.34915512, -0.10629374, -0.08556282, 0.14934721, 0.03240329, -0.04638841,
+         -0.0213243, 0.13015745, 0.0576612, 0.00543907, 0.10794894, -0.16652279, 0.00712322, 0.11292659, 0.19980524,
+         -0.05243455, -0.36826563, -0.01349373, -0.0405997, 0.00494852, 0.14107878, 0.19284475, -0.26511298,
+         -0.07382524, 0.17269546, 0.26876627, -0.01408172, 0.02544168, -0.35238069, 0.14509765, -0.36704814, 0.07925798,
+         -0.12501472, -0.20833919, -0.0986013, -0.00607087, 0.09223775, -0.0442722, 0.09649933, -0.10721662, 0.03898398,
+         -0.02877432, 0.27041949, 0.67374749, -0.15558847, 0.07338436, 0.21598112, -0.37348334, -0.99067959, 0.26119989,
+         0.32156529, 0.95280883, 0.56406814, -0.31868656, -0.12001217, 0.59836807, 0.44369971, -0.05987956, 0.24508276,
+         0.03697629, -0.15699792, 0.30778881, -0.08692812, 0.09946977, -0.92576848, -0.21965702, -0.68400465,
+         -0.8732475, 0.24399806, 0.80587401],
+        dtype=float)
+
+    print(pose.shape)
+
+    beta = np.array([-0.25349993, 0.25009069, 0.21440795, 0.78280628, 0.08625954,
+                     0.28128183, 0.06626327, -0.26495767, 0.09009246, 0.06537955])
+    beat = np.array([1.1135279, -1.1306485, -0.41974258, 0.27553278, 0.45097685, 1.4294435,
+                     0.16033925, -0.05102197, 0.32634377, 1.1299917])
+
+    vbeta = torch.tensor(np.array([beta])).float().to(device)
+    vpose = torch.tensor(np.array([pose])).float().to(device)
+
+    verts, j, r = smpl(vbeta, vpose, get_skin=True)
+
+    smpl.save_obj(verts[0].cpu().numpy(), './mesh.obj')
+
+    rpose = reflect_pose(pose)
+    vpose = torch.tensor(np.array([rpose])).float().to(device)
+
+    verts, j, r = smpl(vbeta, vpose, get_skin=True)
+    smpl.save_obj(verts[0].cpu().numpy(), './rmesh.obj')

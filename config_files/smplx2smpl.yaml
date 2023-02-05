@@ -1,6 +1,6 @@
 datasets:
     mesh_folder:
-        data_folder: 'meshes/smplx'
+        data_folder: 'transfer_data/meshes/smplx-gta'
 deformation_transfer_path: 'transfer_data/smplx2smpl_deftrafo_setup.pkl'
 mask_ids_fname: ''
 summary_steps: 100
@@ -18,7 +18,7 @@ body_model:
     gender: "neutral"
     ext: 'pkl'
     folder: "transfer_data/body_models"
-    use_compressed: False
+    use_compressed: True
     use_face_contour: True
     smpl:
         betas:

@@ -2344,7 +2344,9 @@ def build_layer(
         model_path = os.path.join(model_path, model_type)
     else:
         model_type = osp.basename(model_path).split('_')[0].lower()
-
+    print('******************************************')
+    print('model_path',model_path)
+    print('******************************************')
     if model_type.lower() == 'smpl':
         return SMPLLayer(model_path, **kwargs)
     elif model_type.lower() == 'smplh':
@@ -2409,7 +2411,10 @@ def create(
         model_path = os.path.join(model_path, model_type)
     else:
         model_type = osp.basename(model_path).split('_')[0].lower()
-
+    print('*************************************')
+    print('model_path',model_path)
+    print('model_type',model_type)
+    print('*************************************')
     if model_type.lower() == 'smpl':
         return SMPL(model_path, **kwargs)
     elif model_type.lower() == 'smplh':

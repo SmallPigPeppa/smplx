@@ -56,6 +56,9 @@ def main(
     print(gender)
 
     print(num_betas)
+    print('###################debug##################')
+    print('model_type',model_type)
+    print('##########################################')
     model = smplx.create(
         model_folder,
         model_type=model_type,
@@ -195,7 +198,9 @@ if __name__ == "__main__":
     ext = args.ext
     num_expression_coeffs = args.num_expression_coeffs
     sample_expression = args.sample_expression
-
+    print('###################debug##################')
+    print(model_type)
+    print('##########################################')
     main(
         model_folder,
         motion_file,
