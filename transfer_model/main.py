@@ -14,6 +14,11 @@
 #
 # Contact: Vassilis Choutas, vassilis.choutas@tuebingen.mpg.de
 
+import sys,os
+# print(os.path.dirname(os.getcwd()))
+sys.path.append(os.getcwd())
+sys.path.append(os.path.dirname(os.getcwd()))
+
 import os
 import os.path as osp
 import sys
