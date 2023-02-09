@@ -500,6 +500,7 @@ class SMPLLayer(SMPL):
                             body_pose=body_pose,
                             joints=joints,
                             betas=betas,
+                            transl=transl,
                             full_pose=full_pose if return_full_pose else None)
 
         return output
